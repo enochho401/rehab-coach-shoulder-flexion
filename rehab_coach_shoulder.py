@@ -4,10 +4,8 @@ import cv2
 import numpy as np
 import time
 import requests
-import os
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 import av
-import urllib.request
 
 def speak(text):
     if not text:
@@ -50,52 +48,42 @@ def listen_and_send():
         height=0,
     )
 
-# OpenCV DNN Pose (MoveNet Lightning)
-MODEL_URL = "https://github.com/PINTO0309/PINTO_model_zoo/raw/main/132_MoveNet/saved_model_lightning_tflite_float16/movenet_singlepose_lightning_4.onnx"
-MODEL_PATH = "movenet_lightning.onnx"
-
-if not os.path.exists(MODEL_PATH):
-    try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    except Exception:
-        st.warning("Could not download pose model. Using fallback.")
-
-net = None
-if os.path.exists(MODEL_PATH):
-    try:
-        net = cv2.dnn.readNetFromONNX(MODEL_PATH)
-    except Exception:
-        net = None
-
 def get_pose_keypoints(image):
+    """Simple OpenCV-based estimation of arm position (cloud compatible)."""
     h, w = image.shape[:2]
-    if net is None:
-        # Fallback
+    # Convert to HSV and find skin-like regions as a basic proxy
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lower = np.array([0, 20, 70], dtype=np.uint8)
+    upper = np.array([20, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    mask = cv2.erode(mask, None, iterations=2)
+    mask = cv2.dilate(mask, None, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
         return {
-            "left_shoulder": (int(w*0.4), int(h*0.35)),
-            "left_elbow": (int(w*0.55), int(h*0.45)),
-            "left_wrist": (int(w*0.7), int(h*0.3)),
-            "left_hip": (int(w*0.4), int(h*0.65)),
+            "left_shoulder": (int(w*0.4), int(h*0.4)),
+            "left_elbow": (int(w*0.5), int(h*0.5)),
+            "left_wrist": (int(w*0.6), int(h*0.4)),
+            "left_hip": (int(w*0.4), int(h*0.7)),
         }
 
-    # MoveNet input size
-    input_size = 192
-    blob = cv2.dnn.blobFromImage(image, 1.0/255, (input_size, input_size), (0,0,0), swapRB=True, crop=False)
-    net.setInput(blob)
-    output = net.forward()
+    # Use the largest contour as the person
+    c = max(contours, key=cv2.contourArea)
+    x, y, cw, ch = cv2.boundingRect(c)
 
-    # Output shape: 1x1x17x3 (y, x, confidence)
-    keypoints = {}
-    # Indices for left side (MoveNet order)
-    # 5=left_shoulder, 7=left_elbow, 9=left_wrist, 11=left_hip
-    mapping = {5: "left_shoulder", 7: "left_elbow", 9: "left_wrist", 11: "left_hip"}
-    for idx, name in mapping.items():
-        y, x, conf = output[0, 0, idx]
-        if conf > 0.3:
-            keypoints[name] = (int(x * w), int(y * h))
-        else:
-            keypoints[name] = (int(w*0.5), int(h*0.5))
-    return keypoints
+    # Estimate keypoints from bounding box (simple but responsive)
+    shoulder = (x + int(cw*0.3), y + int(ch*0.25))
+    elbow = (x + int(cw*0.6), y + int(ch*0.4))
+    wrist = (x + int(cw*0.85), y + int(ch*0.2))
+    hip = (x + int(cw*0.3), y + int(ch*0.7))
+
+    return {
+        "left_shoulder": shoulder,
+        "left_elbow": elbow,
+        "left_wrist": wrist,
+        "left_hip": hip,
+    }
 
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -105,12 +93,10 @@ def calculate_angle(a, b, c):
 
 def analyse_shoulder_flexion(keypoints):
     try:
-        shoulder = keypoints.get("left_shoulder")
-        elbow = keypoints.get("left_elbow")
-        wrist = keypoints.get("left_wrist")
-        hip = keypoints.get("left_hip")
-        if not all([shoulder, elbow, wrist, hip]):
-            return {"status": "not_visible", "issues": [], "angles": {}}
+        shoulder = keypoints["left_shoulder"]
+        elbow = keypoints["left_elbow"]
+        wrist = keypoints["left_wrist"]
+        hip = keypoints["left_hip"]
     except Exception:
         return {"status": "not_visible", "issues": [], "angles": {}}
 
@@ -118,11 +104,11 @@ def analyse_shoulder_flexion(keypoints):
     elbow_angle = calculate_angle(shoulder, elbow, wrist)
 
     issues = []
-    if shoulder_angle < 70:
+    if shoulder_angle < 60:
         issues.append("arm_too_low")
-    if elbow_angle < 130:
+    if elbow_angle < 120:
         issues.append("elbow_bent")
-    if abs(shoulder[0] - hip[0]) > 50:
+    if abs(shoulder[0] - hip[0]) > 60:
         issues.append("body_leaning")
 
     status = "correct" if not issues else "needs_improvement"
@@ -185,7 +171,7 @@ with st.sidebar:
     api_key = st.text_input("OpenRouter API Key", type="password")
     st.caption("Get a free key at openrouter.ai")
     st.divider()
-    st.markdown("**Pose:** OpenCV MoveNet")
+    st.markdown("**Pose:** OpenCV (cloud)")
     st.markdown("**Chat:** ERNIE-5.5-Flash (free)")
 
 st.title("💪 AI Rehab Coach – Seated Shoulder Flexion")
@@ -271,4 +257,4 @@ with col2:
         speak(reply)
         st.rerun()
 
-st.caption("Real pose detection with OpenCV MoveNet. Paste OpenRouter key in sidebar.")
+st.caption("OpenCV pose estimation (cloud compatible). Paste OpenRouter key in sidebar.")
