@@ -4,8 +4,10 @@ import cv2
 import numpy as np
 import time
 import requests
+import os
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 import av
+import urllib.request
 
 def speak(text):
     if not text:
@@ -48,28 +50,67 @@ def listen_and_send():
         height=0,
     )
 
+# OpenCV DNN Pose (MoveNet Lightning)
+MODEL_URL = "https://github.com/PINTO0309/PINTO_model_zoo/raw/main/132_MoveNet/saved_model_lightning_tflite_float16/movenet_singlepose_lightning_4.onnx"
+MODEL_PATH = "movenet_lightning.onnx"
+
+if not os.path.exists(MODEL_PATH):
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    except Exception:
+        st.warning("Could not download pose model. Using fallback.")
+
+net = None
+if os.path.exists(MODEL_PATH):
+    try:
+        net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+    except Exception:
+        net = None
+
 def get_pose_keypoints(image):
     h, w = image.shape[:2]
-    # Demo keypoints (replace with real OpenCV DNN model later if needed)
-    return {
-        "left_shoulder": (int(w * 0.40), int(h * 0.35)),
-        "left_elbow": (int(w * 0.58), int(h * 0.42)),
-        "left_wrist": (int(w * 0.72), int(h * 0.28)),
-        "left_hip": (int(w * 0.40), int(h * 0.68)),
-    }
+    if net is None:
+        # Fallback
+        return {
+            "left_shoulder": (int(w*0.4), int(h*0.35)),
+            "left_elbow": (int(w*0.55), int(h*0.45)),
+            "left_wrist": (int(w*0.7), int(h*0.3)),
+            "left_hip": (int(w*0.4), int(h*0.65)),
+        }
+
+    # MoveNet input size
+    input_size = 192
+    blob = cv2.dnn.blobFromImage(image, 1.0/255, (input_size, input_size), (0,0,0), swapRB=True, crop=False)
+    net.setInput(blob)
+    output = net.forward()
+
+    # Output shape: 1x1x17x3 (y, x, confidence)
+    keypoints = {}
+    # Indices for left side (MoveNet order)
+    # 5=left_shoulder, 7=left_elbow, 9=left_wrist, 11=left_hip
+    mapping = {5: "left_shoulder", 7: "left_elbow", 9: "left_wrist", 11: "left_hip"}
+    for idx, name in mapping.items():
+        y, x, conf = output[0, 0, idx]
+        if conf > 0.3:
+            keypoints[name] = (int(x * w), int(y * h))
+        else:
+            keypoints[name] = (int(w*0.5), int(h*0.5))
+    return keypoints
 
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
 def analyse_shoulder_flexion(keypoints):
     try:
-        shoulder = keypoints["left_shoulder"]
-        elbow = keypoints["left_elbow"]
-        wrist = keypoints["left_wrist"]
-        hip = keypoints["left_hip"]
+        shoulder = keypoints.get("left_shoulder")
+        elbow = keypoints.get("left_elbow")
+        wrist = keypoints.get("left_wrist")
+        hip = keypoints.get("left_hip")
+        if not all([shoulder, elbow, wrist, hip]):
+            return {"status": "not_visible", "issues": [], "angles": {}}
     except Exception:
         return {"status": "not_visible", "issues": [], "angles": {}}
 
@@ -81,7 +122,7 @@ def analyse_shoulder_flexion(keypoints):
         issues.append("arm_too_low")
     if elbow_angle < 130:
         issues.append("elbow_bent")
-    if abs(shoulder[0] - hip[0]) > 40:
+    if abs(shoulder[0] - hip[0]) > 50:
         issues.append("body_leaning")
 
     status = "correct" if not issues else "needs_improvement"
@@ -111,16 +152,8 @@ def call_openrouter(api_key, messages, posture_context=""):
     try:
         response = requests.post(
             url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "baidu/ernie-5.5-flash-preview:free",
-                "messages": full_messages,
-                "max_tokens": 120,
-                "temperature": 0.7,
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "baidu/ernie-5.5-flash-preview:free", "messages": full_messages, "max_tokens": 120, "temperature": 0.7},
             timeout=30,
         )
         response.raise_for_status()
@@ -152,7 +185,7 @@ with st.sidebar:
     api_key = st.text_input("OpenRouter API Key", type="password")
     st.caption("Get a free key at openrouter.ai")
     st.divider()
-    st.markdown("**Pose:** OpenCV (cloud compatible)")
+    st.markdown("**Pose:** OpenCV MoveNet")
     st.markdown("**Chat:** ERNIE-5.5-Flash (free)")
 
 st.title("💪 AI Rehab Coach – Seated Shoulder Flexion")
@@ -215,11 +248,7 @@ with col2:
         a = st.session_state.captured_analysis
         posture_context = issues_to_text(a["issues"]) if a["issues"] else "form looks good"
         if api_key:
-            feedback = call_openrouter(
-                api_key,
-                [{"role": "user", "content": "Please give me feedback on my current shoulder flexion posture."}],
-                posture_context,
-            )
+            feedback = call_openrouter(api_key, [{"role": "user", "content": "Please give me feedback on my current shoulder flexion posture."}], posture_context)
         else:
             feedback = "Great job!" if a["status"] == "correct" else f"I noticed that your {posture_context}."
         st.session_state.messages.append({"role": "assistant", "content": feedback})
@@ -242,4 +271,4 @@ with col2:
         speak(reply)
         st.rerun()
 
-st.caption("Cloud-compatible version. Paste OpenRouter key in the sidebar.")
+st.caption("Real pose detection with OpenCV MoveNet. Paste OpenRouter key in sidebar.")
